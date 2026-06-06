@@ -1,5 +1,5 @@
 model_list:
-  # ── ЛОКАЛЬНЫЕ (Ollama, бесплатно) ───────────────────────
+  # ── ЛОКАЛЬНЫЕ (Ollama, $0) ───────────────────────────────────
   - model_name: local-lite
     litellm_params:
       model: ollama/llama3.2:3b
@@ -21,47 +21,73 @@ model_list:
       input_cost_per_token: 0.0
       output_cost_per_token: 0.0
 
-  # ── NVIDIA NIM (бесплатно, 40 RPM) ──────────────────────
+  # ── NVIDIA NIM (free tier, 40 RPM) ──────────────────────────
   - model_name: nvidia-kimi
     litellm_params:
-      model: nvidia/moonshotai/kimi-k2.5
+      model: openai/moonshotai/kimi-k2.5
       api_base: https://integrate.api.nvidia.com/v1
       api_key: os.environ/NVIDIA_NIM_API_KEY
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+
+  - model_name: nvidia-deepseek
+    litellm_params:
+      model: openai/deepseek-ai/deepseek-r1
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
 
   - model_name: nvidia-nemotron
     litellm_params:
-      model: nvidia/nvidia/llama-3.1-nemotron-ultra-253b-v1
+      # исправлен двойной путь nvidia/nvidia/ → nvidia/
+      model: openai/nvidia/llama-3.1-nemotron-ultra-253b-v1
       api_base: https://integrate.api.nvidia.com/v1
       api_key: os.environ/NVIDIA_NIM_API_KEY
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
 
-  # ── GEMINI (дешево) ─────────────────────────────────
+  # ── GEMINI (дёшево) ──────────────────────────────────────────
   - model_name: gemini-flash-lite
     litellm_params:
       model: gemini/gemini-2.0-flash-lite
       api_key: os.environ/GEMINI_API_KEY
+      # Gemini implicit cache — system prompt должен идти первым
+      # кэш срабатывает автоматически при >32K токенов контекста
 
   - model_name: gemini-flash
     litellm_params:
       model: gemini/gemini-2.0-flash
       api_key: os.environ/GEMINI_API_KEY
 
-  # ── ANTHROPIC (только deep) ──────────────────────────
+  # ── ANTHROPIC (только deep задачи) ──────────────────────────
   - model_name: claude-sonnet
     litellm_params:
       model: anthropic/claude-sonnet-4-5
       api_key: os.environ/ANTHROPIC_API_KEY
+      # cache_control передаётся через build_messages() в tokensaver.py
+      # минимальный порог: 1024 токенов для срабатывания ephemeral cache
 
 router_settings:
   routing_strategy: cost-based-routing
+  # Иерархия: local($0) → nvidia-free($0) → gemini(дёшево) → claude(дорого)
   fallbacks:
-    - local-lite: [nvidia-kimi, gemini-flash-lite]
-    - local-medium: [gemini-flash, nvidia-nemotron]
+    - local-lite:   [nvidia-kimi, gemini-flash-lite]
+    - local-medium: [nvidia-nemotron, gemini-flash]
+    - local-code:   [nvidia-deepseek, gemini-flash]
     - claude-sonnet: [gemini-flash]
+    - nvidia-kimi:  [gemini-flash-lite]
 
 litellm_settings:
   cache: true
   cache_params:
-    type: local
+    type: redis          # был 'local' (in-memory) — исправлено на redis
+    host: localhost
+    port: 6379
     ttl: 86400
   drop_params: true
   telemetry: false
+  # Валидация кэша: проверять usage.cache_read_input_tokens > 0
+  # Anthropic: cache_creation_input_tokens (запись) / cache_read_input_tokens (чтение)
+  # Gemini: cached_content_token_count в usage metadata
+  # OpenAI: cached_tokens в prompt_tokens_details
