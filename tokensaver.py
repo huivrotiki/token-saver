@@ -415,8 +415,8 @@ _ROUTE = {
     # cloud fallback = бесплатный NVIDIA NIM (проверенная модель). Gemini-ключ просрочен.
     "lite":   ("ollama/llama3.2:3b",   "nvidia/meta/llama-3.1-8b-instruct"),
     "simple": ("ollama/llama3.2:3b",   "nvidia/meta/llama-3.1-8b-instruct"),
-    "medium": ("ollama/qwen2.5:7b",    "nvidia/meta/llama-3.1-70b-instruct"),
-    "deep":   (None,                    "anthropic/claude-sonnet-4-5"),
+    "medium": ("ollama/qwen2.5:7b",    "vertex/gemini-2.5-flash"),
+    "deep":   (None,                    "anthropic/claude-opus-4-8"),
 }
 
 CLOUD_ONLY = os.environ.get("TOKENSAVER_CLOUD_ONLY", "0") == "1"
@@ -460,7 +460,8 @@ def build_messages(prompt: str, model: str, history: list, system: str) -> list:
 COMPACT_THRESHOLD   = 0.60
 COMPACT_QUALITY_MIN = 0.82
 CONTEXT_LIMITS = {
-    "anthropic/claude-sonnet-4-5": 200_000,
+    "anthropic/claude-opus-4-8":   1_000_000,
+    "vertex/gemini-2.5-flash":     1_048_576,
     "gemini/gemini-2.0-flash":     1_048_576,
     "gemini/gemini-2.0-flash-lite":1_048_576,
     "ollama/llama3.2:3b":          128_000,
@@ -614,13 +615,23 @@ def ask(prompt: str, system: str = DEFAULT_SYSTEM,
     kwargs = {"model": model, "messages": messages}
     if is_local: kwargs["api_base"] = "http://localhost:11434"
     if budget > 0 and "claude" in model:
-        kwargs["thinking"] = {"type":"enabled","budget_tokens":budget}
+        # Opus 4.8/4.7 не принимают enabled+budget_tokens (400) — только adaptive thinking.
+        if "opus-4-8" in model or "opus-4-7" in model:
+            kwargs["thinking"] = {"type":"adaptive"}
+            kwargs["output_config"] = {"effort":"high"}
+        else:
+            kwargs["thinking"] = {"type":"enabled","budget_tokens":budget}
     if "nvidia" in model or "kimi" in model:
         # litellm к кастомному OpenAI-совместимому endpoint: префикс openai/ + сам путь модели.
         # model вида "nvidia/meta/llama-3.1-8b-instruct" → "openai/meta/llama-3.1-8b-instruct"
         kwargs["model"]    = "openai/" + model.split("nvidia/",1)[-1]
         kwargs["api_base"] = "https://integrate.api.nvidia.com/v1"
         kwargs["api_key"]  = os.environ.get("NVIDIA_NIM_API_KEY","")
+    if model.startswith("vertex/"):
+        # Vertex AI Gemini через ADC gcloud (без API-ключа). model: "vertex/gemini-2.5-flash"
+        kwargs["model"]           = "vertex_ai/" + model.split("vertex/",1)[-1]
+        kwargs["vertex_project"]  = os.environ.get("VERTEX_PROJECT","")
+        kwargs["vertex_location"] = os.environ.get("VERTEX_LOCATION","us-central1")
 
     try:
         resp = completion(**kwargs)
@@ -631,10 +642,17 @@ def ask(prompt: str, system: str = DEFAULT_SYSTEM,
         if usage:
             tok_in  = getattr(usage,"prompt_tokens",0) or 0
             tok_out = getattr(usage,"completion_tokens",0) or 0
-            # baseline = во сколько обошёлся бы Claude Sonnet на тех же токенах
-            baseline = round(tok_in*0.000003 + tok_out*0.000015, 6)
+            # baseline = во сколько обошёлся бы Claude Opus 4.8 на тех же токенах ($5/$25 за 1M)
+            baseline = round(tok_in*0.000005 + tok_out*0.000025, 6)
             free = is_local or ("nvidia" in model) or ("kimi" in model)
-            actual = 0.0 if free else baseline
+            if free:
+                actual = 0.0
+            elif "vertex" in model or "gemini" in model:
+                # Gemini 2.5 Flash: ~$0.30/1M in, ~$2.50/1M out
+                actual = round(tok_in*0.0000003 + tok_out*0.0000025, 6)
+            else:
+                # Claude Opus 4.8 (deep)
+                actual = baseline
             stats["baseline_usd"] = baseline
             stats["cost_usd"]     = actual
             stats["saved_usd"]    = round(baseline - actual, 6)
