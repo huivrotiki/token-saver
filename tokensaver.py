@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-TokenSaver v5.0 — 10 механик экономии токенов
-Q1: Auto Compact + quality check + gemini-flash fallback
-Q2: Session Persistence (SQLite, TTL 24h)
-Q4: Semantic Fuzzy Cache (all-MiniLM-L6-v2, cosine >= 0.85)
+TokenSaver v5.2 — 10 механик экономии токенов
+Fix #3: SQLite WAL mode + PRAGMA busy_timeout (concurrent subagents)
+Fix #5: X-Claude-Code-Agent-Id / Parent-Agent-Id tracking + agent cost tree
 
 Run: python3 tokensaver.py --server
-Docs: TOKENSAVER_MASTER.md
+Docs: README.md
 """
 import re, time, hashlib, json, subprocess, uuid, platform, os, logging, sqlite3
 from pathlib import Path
@@ -37,27 +36,138 @@ except Exception:
     _r = None; REDIS_OK = False
 
 # ═══════════════════════════════════════════════════════════════
-# DATABASE — кэш + сессии в одном файле
+# DATABASE — кэш + сессии + агенты
+# FIX #3: WAL mode + busy_timeout для параллельных субагентов
 # ═══════════════════════════════════════════════════════════════
-_db = sqlite3.connect(str(_ts_dir / "tokensaver.db"), check_same_thread=False)
-_db.executescript("""
-    CREATE TABLE IF NOT EXISTS cache (
-        key  TEXT PRIMARY KEY,
-        val  TEXT,
-        ts   REAL,
-        vec  BLOB
-    );
-    CREATE TABLE IF NOT EXISTS sessions (
-        session_id  TEXT PRIMARY KEY,
-        history     TEXT,
-        updated_at  REAL,
-        model       TEXT,
-        msg_count   INTEGER DEFAULT 0,
-        cost_total  REAL DEFAULT 0.0
-    );
-    CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
-""")
-_db.commit()
+def _make_db() -> sqlite3.Connection:
+    db = sqlite3.connect(
+        str(_ts_dir / "tokensaver.db"),
+        check_same_thread=False,
+        timeout=10  # fallback timeout
+    )
+    # FIX #3: WAL mode — позволяет параллельные reads во время write
+    # IMMEDIATE transactions предотвращают SQLITE_BUSY при concurrent writes
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=5000")   # 5 сек ждать вместо SQLITE_BUSY
+    db.execute("PRAGMA synchronous=NORMAL")  # баланс надёжность/скорость
+    db.execute("PRAGMA cache_size=-8000")    # 8MB page cache
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS cache (
+            key  TEXT PRIMARY KEY,
+            val  TEXT,
+            ts   REAL,
+            vec  BLOB
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id  TEXT PRIMARY KEY,
+            history     TEXT,
+            updated_at  REAL,
+            model       TEXT,
+            msg_count   INTEGER DEFAULT 0,
+            cost_total  REAL DEFAULT 0.0
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
+
+        -- FIX #5: таблица субагентов для cost attribution
+        CREATE TABLE IF NOT EXISTS agents (
+            agent_id        TEXT PRIMARY KEY,
+            parent_agent_id TEXT,
+            session_id      TEXT,
+            first_seen      REAL,
+            last_seen       REAL,
+            request_count   INTEGER DEFAULT 0,
+            token_input     INTEGER DEFAULT 0,
+            token_output    INTEGER DEFAULT 0,
+            cost_total      REAL DEFAULT 0.0,
+            model_last      TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_agents_session ON agents(session_id);
+        CREATE INDEX IF NOT EXISTS idx_agents_parent  ON agents(parent_agent_id);
+    """)
+    db.commit()
+    return db
+
+_db = _make_db()
+
+def _db_write(sql: str, params: tuple = ()):
+    """Thread-safe запись с BEGIN IMMEDIATE (предотвращает SQLITE_BUSY)."""
+    for attempt in range(3):
+        try:
+            with _db:  # автоматический commit/rollback
+                _db.execute("BEGIN IMMEDIATE" if attempt == 0 else "BEGIN")
+                _db.execute(sql, params)
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e) and attempt < 2:
+                time.sleep(0.1 * (attempt + 1))
+                log.warning(f"DB_LOCKED attempt={attempt+1}, retrying")
+            else:
+                log.error(f"DB_WRITE_FAIL: {e}")
+                raise
+
+# ═══════════════════════════════════════════════════════════════
+# FIX #5: Agent Cost Tracking
+# Источник: Claude Code LLM Gateway docs — X-Claude-Code-Agent-Id
+# https://code.claude.com/docs/en/llm-gateway
+# ═══════════════════════════════════════════════════════════════
+def agent_record(agent_id: str, parent_agent_id: Optional[str],
+                 session_id: str, model: str,
+                 token_in: int, token_out: int, cost: float):
+    """Записать/обновить статистику субагента."""
+    if not agent_id:
+        return
+    now = time.time()
+    _db.execute("""
+        INSERT INTO agents(
+            agent_id, parent_agent_id, session_id, first_seen, last_seen,
+            request_count, token_input, token_output, cost_total, model_last
+        ) VALUES(?,?,?,?,?,1,?,?,?,?)
+        ON CONFLICT(agent_id) DO UPDATE SET
+            last_seen    = excluded.last_seen,
+            request_count= agents.request_count + 1,
+            token_input  = agents.token_input  + excluded.token_input,
+            token_output = agents.token_output + excluded.token_output,
+            cost_total   = agents.cost_total   + excluded.cost_total,
+            model_last   = excluded.model_last
+    """, (agent_id, parent_agent_id, session_id, now, now,
+           token_in, token_out, cost, model))
+    _db.commit()
+    log.info(f"AGENT_RECORDED id={agent_id[:8]} parent={str(parent_agent_id)[:8]} "
+             f"cost={cost:.5f} in={token_in} out={token_out}")
+
+def agent_tree(session_id: str) -> list:
+    """Вернуть дерево субагентов для сессии (для дашборда)."""
+    rows = _db.execute(
+        "SELECT agent_id, parent_agent_id, request_count, "
+        "token_input, token_output, cost_total, model_last, last_seen "
+        "FROM agents WHERE session_id=? ORDER BY first_seen",
+        (session_id,)
+    ).fetchall()
+    return [{
+        "agent_id":        r[0],
+        "parent_agent_id": r[1],
+        "requests":        r[2],
+        "token_input":     r[3],
+        "token_output":    r[4],
+        "cost_total":      round(r[5], 6),
+        "model":           r[6],
+        "last_seen":       r[7],
+    } for r in rows]
+
+def agent_stats_all() -> dict:
+    """Топ агентов по стоимости (для /stats endpoint)."""
+    rows = _db.execute(
+        "SELECT agent_id, parent_agent_id, cost_total, request_count "
+        "FROM agents ORDER BY cost_total DESC LIMIT 20"
+    ).fetchall()
+    return {
+        "top_agents": [{
+            "agent_id": r[0][:16] + "...",
+            "parent":   (r[1] or "")[:16],
+            "cost":     round(r[2], 6),
+            "requests": r[3]
+        } for r in rows]
+    }
 
 # ═══════════════════════════════════════════════════════════════
 # МЕХАНИКА 7: Device Fingerprint
@@ -122,8 +232,6 @@ def is_code_task(prompt: str) -> bool:
 
 # ═══════════════════════════════════════════════════════════════
 # МЕХАНИКА 2: Семантический кэш L1/L2/L3 + Q4 Fuzzy
-# Модель: all-MiniLM-L6-v2 (~80MB, CPU, ленивая загрузка)
-# Точный SHA + cosine similarity >= 0.85 → +30% cache hit rate
 # ═══════════════════════════════════════════════════════════════
 _L1: dict = {}
 _L1_VEC: list = []
@@ -175,19 +283,13 @@ def _ck(prompt: str) -> str:
 def cache_get(prompt: str) -> Optional[str]:
     if _NO_CACHE.search(prompt): return None
     key = _ck(prompt)
-
-    # L1 exact
     if key in _L1: return _L1[key]
-    # L2 Redis exact
     if REDIS_OK:
         v = _r.get(key)
         if v: _L1[key] = v; return v
-    # L3 SQLite exact
     row = _db.execute("SELECT val FROM cache WHERE key=? AND ts>?",
                       (key, time.time()-604800)).fetchone()
     if row: _L1[key] = row[0]; return row[0]
-
-    # Fuzzy L1 RAM
     if _L1_VEC:
         vec = _embed(prompt)
         if vec is not None:
@@ -198,8 +300,6 @@ def cache_get(prompt: str) -> Optional[str]:
             if best_s >= _FUZZY_THRESHOLD and best_k in _L1:
                 log.info(f"FUZZY_HIT_L1 sim={best_s:.3f}")
                 return _L1[best_k]
-
-            # Fuzzy SQLite (top 100)
             rows = _db.execute(
                 "SELECT key, val, vec FROM cache WHERE ts>? AND vec IS NOT NULL LIMIT 100",
                 (time.time()-604800,)
@@ -240,7 +340,7 @@ def cache_set(prompt: str, response: str):
     _db.commit()
 
 # ═══════════════════════════════════════════════════════════════
-# Q2 FIX: Session Persistence (SQLite, TTL=24h)
+# Q2: Session Persistence (SQLite WAL, TTL=24h)
 # ═══════════════════════════════════════════════════════════════
 SESSION_TTL = 86400
 MAX_HISTORY = 40
@@ -344,10 +444,10 @@ def build_messages(prompt: str, model: str, history: list, system: str) -> list:
            [{"role":"user","content":prompt}]
 
 # ═══════════════════════════════════════════════════════════════
-# Q1 FIX: Auto Compact + Quality Check + Fallback gemini-flash
+# Q1: Auto Compact + Quality Check + Fallback gemini-flash
 # ═══════════════════════════════════════════════════════════════
-COMPACT_THRESHOLD       = 0.78
-COMPACT_QUALITY_MIN     = 0.82
+COMPACT_THRESHOLD   = 0.78
+COMPACT_QUALITY_MIN = 0.82
 CONTEXT_LIMITS = {
     "anthropic/claude-sonnet-4-5": 200_000,
     "gemini/gemini-2.0-flash":     1_048_576,
@@ -396,21 +496,16 @@ def maybe_compact(messages: list, model: str, verbose: bool = True) -> tuple:
     limit = CONTEXT_LIMITS.get(model, CONTEXT_LIMITS["default"])
     if _count_tokens(messages) < limit * COMPACT_THRESHOLD:
         return messages, False
-
     sys_msgs = [m for m in messages if m.get("role") == "system"]
     non_sys  = [m for m in messages if m.get("role") != "system"]
     recent   = non_sys[-4:]
     to_compact = non_sys[:-4]
     if not to_compact: return messages, False
-
     terms = _extract_terms(to_compact)
     hist_text = "\n".join(
         f"[{m['role'].upper()}]: {str(m.get('content',''))[:1000]}" for m in to_compact
     )
-
     summary, used_model, quality = None, "none", 0.0
-
-    # Попытка 1: local Ollama
     for local_m in ["llama3.2:3b", "qwen3:14b"]:
         if _ollama_has(local_m):
             s = _compact_with(f"ollama/{local_m}", hist_text, is_local=True)
@@ -422,8 +517,6 @@ def maybe_compact(messages: list, model: str, verbose: bool = True) -> tuple:
                     break
                 elif verbose:
                     print(f"🗜️⚡ local quality={q:.2f} < {COMPACT_QUALITY_MIN} → fallback")
-
-    # Fallback: gemini-flash-lite (бесплатно)
     if summary is None:
         s = _compact_with("gemini/gemini-2.0-flash-lite", hist_text, is_local=False)
         if s:
@@ -431,15 +524,12 @@ def maybe_compact(messages: list, model: str, verbose: bool = True) -> tuple:
             summary, used_model, quality = s, "gemini/gemini-2.0-flash-lite", q
             if verbose: print(f"   gemini-flash quality={q:.2f}")
             log.info(f"COMPACT_FALLBACK quality={q:.2f}")
-
     if summary is None:
         return messages, False
-
     saved = _count_tokens(messages) - _count_tokens(
         sys_msgs + [{"role":"system","content":summary}] + recent)
     if verbose: print(f"   saved={saved} tok | {len(to_compact)} msgs → 1 summary")
     log.info(f"COMPACT_DONE saved={saved} quality={quality:.2f} model={used_model}")
-
     return sys_msgs + [
         {"role":"system","content":
          f"[AUTO-COMPACT v5 | {used_model.split('/')[-1]} | q={quality:.2f}]\n{summary}"},
@@ -525,9 +615,11 @@ def ask(prompt: str, system: str = DEFAULT_SYSTEM,
         if usage and hasattr(usage,"cache_read_input_tokens"):
             stats["provider_cache"] = (usage.cache_read_input_tokens or 0) > 0
         if usage:
-            stats["cost_usd"] = round(
-                (getattr(usage,"prompt_tokens",0)*0.000003 +
-                 getattr(usage,"completion_tokens",0)*0.000015), 6)
+            tok_in  = getattr(usage,"prompt_tokens",0) or 0
+            tok_out = getattr(usage,"completion_tokens",0) or 0
+            stats["cost_usd"] = round(tok_in*0.000003 + tok_out*0.000015, 6)
+            stats["token_input"]  = tok_in
+            stats["token_output"] = tok_out
     except Exception as e:
         log.error(f"LLM_ERROR model={model}: {e}")
         return {"response": f"[Error: {e}]", "stats": stats}
@@ -550,6 +642,7 @@ def ask(prompt: str, system: str = DEFAULT_SYSTEM,
 
 # ═══════════════════════════════════════════════════════════════
 # HTTP PROXY SERVER — Claude Code / OpenAI compatible
+# FIX #5: перехват X-Claude-Code-Agent-Id / X-Claude-Code-Parent-Agent-Id
 # ═══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import argparse
@@ -573,8 +666,18 @@ if __name__ == "__main__":
         def proxy():
             data = request.json or {}
             msgs = data.get("messages", [])
+
+            # FIX #5: перехват Agent ID заголовков (Claude Code LLM Gateway)
+            # Docs: https://code.claude.com/docs/en/llm-gateway
+            agent_id        = (request.headers.get("X-Claude-Code-Agent-Id") or
+                               request.headers.get("anthropic-beta", "").split(",")[0] or
+                               None)
+            parent_agent_id = request.headers.get("X-Claude-Code-Parent-Agent-Id") or None
+
             session_id = (request.headers.get("X-Session-Id") or
-                          data.get("session_id") or "default")
+                          data.get("session_id") or
+                          (f"agent-{agent_id[:16]}" if agent_id else "default"))
+
             prompt = msgs[-1].get("content","") if msgs else ""
             system = next((m["content"] for m in msgs if m.get("role")=="system"),
                           DEFAULT_SYSTEM)
@@ -582,25 +685,41 @@ if __name__ == "__main__":
             result  = ask(prompt, system=system, history=history)
             history.append({"role":"user","content":prompt})
             history.append({"role":"assistant","content":result["response"]})
+            s = result["stats"]
             session_save(session_id, history,
-                         model=result["stats"].get("model",""),
-                         cost=result["stats"].get("cost_usd",0.0))
+                         model=s.get("model",""),
+                         cost=s.get("cost_usd",0.0))
+
+            # FIX #5: записать статистику субагента
+            if agent_id:
+                agent_record(
+                    agent_id=agent_id,
+                    parent_agent_id=parent_agent_id,
+                    session_id=session_id,
+                    model=s.get("model",""),
+                    token_in=s.get("token_input",0),
+                    token_out=s.get("token_output",0),
+                    cost=s.get("cost_usd",0.0)
+                )
+
             return jsonify({
                 "choices":[{"message":{"role":"assistant",
                             "content":result["response"]},"finish_reason":"stop"}],
-                "model": result["stats"]["model"],
+                "model": s.get("model"),
                 "session_id": session_id,
-                "tokensaver_stats": result["stats"]
+                "agent_id": agent_id,
+                "tokensaver_stats": s
             })
 
         @app.route("/health")
         def health():
             sess = session_stats()
-            return jsonify({"status":"ok","version":"5.0",
+            return jsonify({"status":"ok","version":"5.2",
                             "device_id":DEVICE_ID[:8]+"...","redis":REDIS_OK,
                             "ollama":_ollama_has("llama3.2"),
                             "embed_model":_embed_ok,
-                            "sessions_active":sess["active"]})
+                            "sessions_active":sess["active"],
+                            "db_mode":"WAL"})
 
         @app.route("/sessions")
         def sessions_ep(): return jsonify(session_stats())
@@ -612,21 +731,37 @@ if __name__ == "__main__":
         def stats_ep():
             ct = _db.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
             cv = _db.execute("SELECT COUNT(*) FROM cache WHERE vec IS NOT NULL").fetchone()[0]
+            ag = _db.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
             return jsonify({"cache_entries":ct,"cache_with_vectors":cv,
+                            "agents_tracked":ag,
                             "l1_size":len(_L1),"l1_vecs":len(_L1_VEC),
-                            "redis":REDIS_OK,**session_stats()})
+                            "redis":REDIS_OK,
+                            **session_stats(),
+                            **agent_stats_all()})
 
-        print(f"\nTokenSaver v5.0 → http://localhost:4000")
+        # FIX #5: новый endpoint — дерево субагентов для дашборда
+        @app.route("/agents")
+        def agents_ep():
+            session_id = request.args.get("session_id", "default")
+            return jsonify(agent_tree(session_id))
+
+        @app.route("/agents/all")
+        def agents_all_ep():
+            return jsonify(agent_stats_all())
+
+        print(f"\nTokenSaver v5.2 → http://localhost:4000")
         print(f"Device : TS-{DEVICE_ID[:4].upper()}-{DEVICE_ID[4:8].upper()}")
         print(f"Redis  : {'✅' if REDIS_OK else '⚠️  off'}")
         print(f"Ollama : {'✅' if _ollama_has('llama3.2') else '⚠️  not found'}")
         print(f"Fuzzy  : {'✅ all-MiniLM-L6-v2' if _embed_ok else '⚠️  pip install sentence-transformers'}")
-        print(f"DB     : {_ts_dir / 'tokensaver.db'}\n")
+        print(f"DB     : WAL mode ✅  {_ts_dir / 'tokensaver.db'}")
+        print(f"Agents : /agents?session_id=... | /agents/all")
+        print(f"")
         app.run(host="0.0.0.0", port=4000, debug=False)
 
     else:
         session_id = f"interactive-{DEVICE_ID[:8]}"
-        print("TokenSaver v5.0 · Ctrl+C — выход\n")
+        print("TokenSaver v5.2 · Ctrl+C — выход\n")
         while True:
             try:
                 p = input("You: ").strip()
