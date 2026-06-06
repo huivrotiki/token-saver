@@ -1,0 +1,67 @@
+model_list:
+  # ── ЛОКАЛЬНЫЕ (Ollama, бесплатно) ───────────────────────
+  - model_name: local-lite
+    litellm_params:
+      model: ollama/llama3.2:3b
+      api_base: http://localhost:11434
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+
+  - model_name: local-code
+    litellm_params:
+      model: ollama/qwen2.5-coder:7b
+      api_base: http://localhost:11434
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+
+  - model_name: local-medium
+    litellm_params:
+      model: ollama/qwen3:14b
+      api_base: http://localhost:11434
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+
+  # ── NVIDIA NIM (бесплатно, 40 RPM) ──────────────────────
+  - model_name: nvidia-kimi
+    litellm_params:
+      model: nvidia/moonshotai/kimi-k2.5
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+
+  - model_name: nvidia-nemotron
+    litellm_params:
+      model: nvidia/nvidia/llama-3.1-nemotron-ultra-253b-v1
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+
+  # ── GEMINI (дешево) ─────────────────────────────────
+  - model_name: gemini-flash-lite
+    litellm_params:
+      model: gemini/gemini-2.0-flash-lite
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: gemini-flash
+    litellm_params:
+      model: gemini/gemini-2.0-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  # ── ANTHROPIC (только deep) ──────────────────────────
+  - model_name: claude-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+router_settings:
+  routing_strategy: cost-based-routing
+  fallbacks:
+    - local-lite: [nvidia-kimi, gemini-flash-lite]
+    - local-medium: [gemini-flash, nvidia-nemotron]
+    - claude-sonnet: [gemini-flash]
+
+litellm_settings:
+  cache: true
+  cache_params:
+    type: local
+    ttl: 86400
+  drop_params: true
+  telemetry: false
