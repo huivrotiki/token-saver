@@ -34,6 +34,11 @@ def get_db_stats() -> dict:
             "FROM sessions WHERE updated_at>? ORDER BY updated_at DESC LIMIT 20",
             (time.time()-86400,)
         ).fetchall()
+        agents_rows = []
+        try:
+            agents_rows = c.execute("SELECT agent_id, parent_agent_id, cost_total, request_count FROM agents LIMIT 100").fetchall()
+        except sqlite3.OperationalError:
+            pass
         c.close()
         return {
             "cache_total":  cache_total,
@@ -43,10 +48,11 @@ def get_db_stats() -> dict:
             "sess_msgs":    sess[1],
             "sess_cost":    round(sess[2], 5),
             "sess_rows":    sess_rows,
+            "agents_rows":  agents_rows,
         }
     except Exception:
         return {"cache_total":0,"cache_vecs":0,"cache_recent":0,
-                "sess_active":0,"sess_msgs":0,"sess_cost":0.0,"sess_rows":[]}
+                "sess_active":0,"sess_msgs":0,"sess_cost":0.0,"sess_rows":[],"agents_rows":[]}
 
 def get_log_metrics() -> dict:
     m = {
@@ -144,6 +150,8 @@ app.layout = html.Div([
                  style={"background":CARD,"borderRadius":"12px","padding":"12px"}),
         html.Div([dcc.Graph(id="quality-gauge", config={"displayModeBar":False})],
                  style={"background":CARD,"borderRadius":"12px","padding":"12px"}),
+        html.Div([dcc.Graph(id="agents-treemap", config={"displayModeBar":False})],
+                 style={"background":CARD,"borderRadius":"12px","padding":"12px","gridColumn":"1 / -1"}),
     ], style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr",
               "gap":"12px","padding":"0 20px 20px"}),
 
@@ -162,6 +170,7 @@ app.layout = html.Div([
     Output("compact-bar",    "figure"),
     Output("sessions-chart", "figure"),
     Output("quality-gauge",  "figure"),
+    Output("agents-treemap", "figure"),
     Output("ts",             "children"),
     Input("tick", "n_intervals")
 )
@@ -317,9 +326,30 @@ def update(n):
     fig_q.update_layout(paper_bgcolor=CARD,font=dict(color="#aaa"),
                         margin=dict(l=30,r=30,t=70,b=20))
 
+    # ── Agents Treemap ──
+    agents = db.get("agents_rows", [])
+    if agents:
+        ids = [a[0] for a in agents]
+        parents = [a[1] if a[1] and a[1] in ids else "" for a in agents]
+        values = [max(a[2]*1000, 0.001) for a in agents] # cost in m$ or min value
+        labels = [f"{a[0][:12]}<br>{a[3]} reqs | {a[2]*1000:.1f} m$" for a in agents]
+        fig_agents = go.Figure(go.Treemap(
+            ids=ids,
+            labels=labels,
+            parents=parents,
+            values=values,
+            branchvalues="total",
+            marker_colorscale="Tealgrn",
+            textinfo="label"
+        ))
+        fig_agents.update_layout(title="🤖 Дерево Субагентов (Cost)", margin=dict(t=40, l=10, r=10, b=10), **dark())
+    else:
+        fig_agents = go.Figure()
+        fig_agents.update_layout(title="🤖 Дерево Субагентов (No data)", **dark())
+
     ts = f"Updated: {time.strftime('%H:%M:%S')}"
     return (kpi_main, kpi_compact, fig_cost, fig_route,
-            fig_save, fig_compact, fig_sess, fig_q, ts)
+            fig_save, fig_compact, fig_sess, fig_q, fig_agents, ts)
 
 
 if __name__ == "__main__":
