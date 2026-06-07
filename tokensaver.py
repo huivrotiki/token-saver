@@ -416,7 +416,8 @@ _ROUTE = {
     "lite":   ("ollama/llama3.2:3b",   "nvidia/meta/llama-3.1-8b-instruct"),
     "simple": ("ollama/llama3.2:3b",   "nvidia/meta/llama-3.1-8b-instruct"),
     "medium": ("ollama/qwen2.5:7b",    "vertex/gemini-2.5-flash"),
-    "deep":   (None,                    "anthropic/claude-opus-4-8"),
+    # deep БЕЗ Anthropic (баланса нет): Gemini 2.5 Pro через gcloud ADC — топ-качество.
+    "deep":   (None,                    "vertex/gemini-2.5-pro"),
 }
 
 CLOUD_ONLY = os.environ.get("TOKENSAVER_CLOUD_ONLY", "0") == "1"
@@ -462,6 +463,7 @@ COMPACT_QUALITY_MIN = 0.82
 CONTEXT_LIMITS = {
     "anthropic/claude-opus-4-8":   1_000_000,
     "vertex/gemini-2.5-flash":     1_048_576,
+    "vertex/gemini-2.5-pro":       2_097_152,
     "gemini/gemini-2.0-flash":     1_048_576,
     "gemini/gemini-2.0-flash-lite":1_048_576,
     "ollama/llama3.2:3b":          128_000,
@@ -612,6 +614,26 @@ def ask(prompt: str, system: str = DEFAULT_SYSTEM,
         return {"response": "[pip install litellm]", "stats": stats}
 
     budget = BUDGET.get(level, 0)
+
+    # opencode lane — делегирование на opencode CLI (subscription = $0 за токены).
+    # model вида "opencode/<provider>/<model>" или env TOKENSAVER_OPENCODE_MODEL.
+    if model.startswith("opencode/"):
+        oc_model = model.split("opencode/",1)[-1]
+        try:
+            p = subprocess.run(
+                ["opencode","run",prompt] + (["-m",oc_model] if oc_model else []),
+                capture_output=True, text=True, timeout=180
+            )
+            raw = (p.stdout or p.stderr or "").strip()
+            stats["cost_usd"] = 0.0  # subscription
+            stats["baseline_usd"] = round(len(prompt.split())*1.3*0.00002, 6)
+            stats["saved_usd"] = stats["baseline_usd"]
+            cache_set(prompt, raw) if not history else None
+            return {"response": rtk(raw), "stats": stats}
+        except Exception as e:
+            log.error(f"opencode_lane error: {e}")
+            return {"response": f"[opencode error: {e}]", "stats": stats}
+
     kwargs = {"model": model, "messages": messages}
     if is_local: kwargs["api_base"] = "http://localhost:11434"
     if budget > 0 and "claude" in model:
@@ -648,10 +670,14 @@ def ask(prompt: str, system: str = DEFAULT_SYSTEM,
             if free:
                 actual = 0.0
             elif "vertex" in model or "gemini" in model:
-                # Gemini 2.5 Flash: ~$0.30/1M in, ~$2.50/1M out
-                actual = round(tok_in*0.0000003 + tok_out*0.0000025, 6)
+                if "pro" in model:
+                    # Gemini 2.5 Pro: ~$1.25/1M in, ~$10/1M out
+                    actual = round(tok_in*0.00000125 + tok_out*0.00001, 6)
+                else:
+                    # Gemini 2.5 Flash: ~$0.30/1M in, ~$2.50/1M out
+                    actual = round(tok_in*0.0000003 + tok_out*0.0000025, 6)
             else:
-                # Claude Opus 4.8 (deep)
+                # любой прочий (на случай ручного override) = baseline
                 actual = baseline
             stats["baseline_usd"] = baseline
             stats["cost_usd"]     = actual
