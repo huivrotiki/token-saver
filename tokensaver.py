@@ -496,7 +496,16 @@ def _compact_with(model_id: str, history_text: str, is_local: bool) -> Optional[
         kw = {"model": model_id,
               "messages": [{"role":"user","content": COMPACT_SYSTEM+"\n\n"+history_text}],
               "max_tokens": 1000}
-        if is_local: kw["api_base"] = "http://localhost:11434"
+        if is_local:
+            kw["api_base"] = "http://localhost:11434"
+        elif "nvidia" in model_id:
+            kw["model"]    = "openai/" + model_id.split("nvidia/",1)[-1]
+            kw["api_base"] = "https://integrate.api.nvidia.com/v1"
+            kw["api_key"]  = os.environ.get("NVIDIA_NIM_API_KEY","")
+        elif model_id.startswith("vertex/"):
+            kw["model"]           = "vertex_ai/" + model_id.split("vertex/",1)[-1]
+            kw["vertex_project"]  = os.environ.get("VERTEX_PROJECT","")
+            kw["vertex_location"] = os.environ.get("VERTEX_LOCATION","us-central1")
         r = completion(**kw)
         return r.choices[0].message.content or ""
     except Exception as e:
@@ -520,24 +529,27 @@ def maybe_compact(messages: list, model: str, verbose: bool = True) -> tuple:
         f"[{m['role'].upper()}]: {str(m.get('content',''))[:1000]}" for m in to_compact
     )
     summary, used_model, quality = None, "none", 0.0
-    for local_m in ["llama3.2:3b", "qwen3:8b"]:
-        if _ollama_has(local_m):
-            s = _compact_with(f"ollama/{local_m}", hist_text, is_local=True)
-            if s:
-                q = _quality(s, terms)
-                if q >= COMPACT_QUALITY_MIN:
-                    summary, used_model, quality = s, f"ollama/{local_m}", q
-                    if verbose: print(f"🗜️  COMPACT local={local_m} quality={q:.2f}")
-                    break
-                elif verbose:
-                    print(f"🗜️⚡ local quality={q:.2f} < {COMPACT_QUALITY_MIN} → fallback")
-    if summary is None:
-        s = _compact_with("gemini/gemini-2.0-flash-lite", hist_text, is_local=False)
+    # Compactor order: fast FREE cloud (NIM) first — local Ollama is too slow on CPU
+    # for the request path. Local kept as offline fallback only.
+    candidates = [
+        ("nvidia/meta/llama-3.1-8b-instruct", False),
+        ("vertex/gemini-2.5-flash",           False),
+    ]
+    for lm in ["llama3.2:3b", "qwen2.5:7b"]:
+        if _ollama_has(lm):
+            candidates.append((f"ollama/{lm}", True))
+    for model_id, is_local in candidates:
+        s = _compact_with(model_id, hist_text, is_local=is_local)
         if s:
             q = _quality(s, terms)
-            summary, used_model, quality = s, "gemini/gemini-2.0-flash-lite", q
-            if verbose: print(f"   gemini-flash quality={q:.2f}")
-            log.info(f"COMPACT_FALLBACK quality={q:.2f}")
+            if q >= COMPACT_QUALITY_MIN or model_id.startswith(("nvidia/", "vertex/")):
+                summary, used_model, quality = s, model_id, q
+                if verbose: print(f"🗜️  COMPACT model={model_id} quality={q:.2f}")
+                break
+            elif verbose:
+                print(f"🗜️⚡ {model_id} quality={q:.2f} < {COMPACT_QUALITY_MIN} → next")
+    if summary is not None:
+        log.info(f"COMPACT model={used_model} quality={quality:.2f}")
     if summary is None:
         return messages, False
     saved = _count_tokens(messages) - _count_tokens(
