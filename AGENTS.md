@@ -21,44 +21,84 @@
 | Google AI Studio model ID исправлены | ✅ |
 | vertex / agent-platform провайдеры удалены (ADC не настроен) | ✅ |
 | TokenSaver v5.3 установлен, фиксы применены | ✅ |
-| **9router запускается и не падает** | ❌ BLOCKER |
-| NINEROUTER_KEY получен и установлен | ❌ |
+| 9router запускается (меню появляется) | ✅ |
+| **NINEROUTER_KEY получен и установлен** | ❌ |
 | RTK компрессия проверена через дашборд | ❌ |
 | End-to-end тест OpenCode → 9router → модель | ❌ |
 
 ---
 
-## Главный блокер: 9router падает при старте
+## Google Agent Skills
 
-**Симптом:** процесс завершается мгновенно, `9router_output.log` пуст.
+**Репозиторий:** `github.com/google/skills`
 
-**Диагностика — выполнить последовательно:**
+Официальные skill-файлы от Google: агент читает их автоматически и знает правильные model ID,
+параметры API и паттерны Gemini без дополнительных инструкций.
 
 ```bash
-# 1. Добавить в PATH (если ещё не)
-export PATH="/Users/work/.hermes/node/bin:$PATH"
+# Установить (один раз)
+npx skills add google/skills
 
-# 2. Проверить что бинарь существует
-ls -la /Users/work/.hermes/node/bin/9router
-node /Users/work/.hermes/node/lib/node_modules/9router/cli.js --version
-
-# 3. Запустить с явным логом
-node /Users/work/.hermes/node/lib/node_modules/9router/cli.js \
-  --listen 20128 2>&1 | tee /tmp/9router_output.log
-
-# 4. Если ошибка про missing modules:
-npm install -g 9router
-
-# 5. Проверить нужен ли NINEROUTER_KEY
-# Ключ получить: https://9router.com → Login → Dashboard → API Key
-export NINEROUTER_KEY=<key_from_dashboard>
-9router --listen 20128
+# Выбрать из списка:
+# ✓ Gemini API on Agent Platform
+# ✓ Gemini Interactions API on Agent Platform
 ```
 
-**Вероятные причины падения:**
-- Отсутствует `NINEROUTER_KEY` (требует OAuth login на 9router.com)
-- Node.js модули не установлены полностью
-- Порт 20128 уже занят (`lsof -i :20128`)
+### Доступные skills
+
+| Skill | Что даёт |
+|-------|----------|
+| Gemini API on Agent Platform | Правильные model ID, параметры generateContent, safety settings |
+| Gemini Interactions API | Паттерны multi-turn, streaming, function calling |
+
+### Правильные model ID для Agent Platform
+
+```
+gemini-2.5-pro-preview-06-05
+gemini-2.5-flash-preview-05-20
+gemini-2.0-flash-001
+gemini-1.5-pro-002
+gemini-1.5-flash-002
+```
+
+> ⚠️ Не существуют: `gemini-3.x`, `gemma-4`, `gemini-2.5-pro-preview-05-06` (устаревший)
+
+### ADC для Agent Platform (если нужен Vertex)
+
+```bash
+# Только в интерактивном терминале (Terminal.app, не в Claude Code)
+gcloud auth application-default login
+gcloud config set project <PROJECT_ID>
+```
+
+> Примечание: `gcloud auth` не работает в non-interactive среде.
+> Если ADC не настроен — используй Google AI Studio с `GEMINI_API_KEY`.
+
+---
+
+## Главный блокер: NINEROUTER_KEY
+
+9router запускается (меню появляется), но требует API ключ для провайдеров.
+
+```bash
+# Получить ключ:
+# 1. Запустить 9router
+node /Users/work/.hermes/node/lib/node_modules/9router/cli.js --listen 20128
+# 2. В меню выбрать: Web UI
+# 3. Dashboard → API Keys → Create → скопировать
+
+# Установить:
+echo "NINEROUTER_KEY=<ключ>" >> ~/.tokensaver/.env
+export NINEROUTER_KEY=<ключ>
+```
+
+**Запуск 9router без зависания терминала:**
+```bash
+nohup node /Users/work/.hermes/node/lib/node_modules/9router/cli.js \
+  --listen 20128 > /tmp/9router.log 2>&1 &
+echo "PID: $!"
+curl http://localhost:20128/v1/models 2>/dev/null && echo "✅ OK"
+```
 
 ---
 
@@ -73,7 +113,6 @@ export NINEROUTER_KEY=<key_from_dashboard>
 | `~/.zshrc` | PATH должен включать `/Users/work/.hermes/node/bin` |
 | `/Users/work/serpentos/SESSION-LIMBO.md` | Контекст сессии Antigravity |
 | `/Users/work/serpentos/OS-NOTES.md` | Глобальный changelog проекта |
-| `9router_output.log` | Лог запуска 9router (создать: `touch 9router_output.log`) |
 
 ---
 
@@ -132,18 +171,16 @@ export NINEROUTER_KEY=<key_from_dashboard>
 ## TokenSaver — быстрый старт
 
 ```bash
-# Запустить
-ai-start          # alias: Redis + tokensaver :4000
-ai-dash           # alias: dashboard :8050
-
-# Проверить
+ai-start          # Redis + tokensaver :4000
+ai-dash           # dashboard :8050
 curl http://localhost:4000/health
 ai-stats
 
-# Переменные (добавить в ~/.tokensaver/.env)
+# ~/.tokensaver/.env
 GEMINI_API_KEY=AIza...
 NVIDIA_NIM_API_KEY=nvapi-...
 NINEROUTER_BASE_URL=http://localhost:20128/v1
+NINEROUTER_KEY=<key>
 ```
 
 ---
@@ -166,9 +203,10 @@ OpenCode / Claude Code
 
 ## Известные проблемы
 
-- `gcloud auth application-default login` не работает в non-interactive терминале — ADC не настроен, используй Google AI Studio вместо Vertex
-- Doppler secrets не содержат `NINEROUTER_KEY` — получить вручную с 9router.com
-- `source .env` в bash tool не персистирует переменные — использовать `export $(cat .env | xargs)` или устанавливать переменные напрямую
+- `gcloud auth application-default login` не работает в non-interactive терминале — используй Google AI Studio вместо Vertex
+- Doppler secrets не содержат `NINEROUTER_KEY` — получить вручную с 9router.com → Web UI → API Keys
+- `source .env` в bash tool не персистирует переменные — использовать `export $(grep -v '^#' .env | xargs)`
+- bash tool требует поле `description` — если агент выдаёт `Invalid input: description undefined`, переформулируй запрос или перезапусти сессию
 - git не инициализирован в `/Users/work/serpentos` — если нужен: `cd /Users/work/serpentos && git init && git add . && git commit -m 'init'`
 
 ---
