@@ -37,5 +37,7 @@ jobs:
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
     - name: Test with pytest
       run: |
-        # exit code 5 = no tests collected; treat as success until tests are added
-        pytest; code=$?; [ $code -eq 5 ] && exit 0 || exit $code
+        # exit code 5 = no tests collected; treat as success until tests are added.
+        # `pytest || code=$?` is errexit-safe; a bare `pytest` would abort under `bash -e`.
+        pytest || code=$?
+        if [ "${code:-0}" -eq 5 ]; then exit 0; else exit "${code:-0}"; fi
