@@ -28,7 +28,7 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         python -m pip install flake8 pytest
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names
@@ -37,4 +37,7 @@ jobs:
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
     - name: Test with pytest
       run: |
-        pytest
+        # exit code 5 = no tests collected; treat as success until tests are added.
+        # `pytest || code=$?` is errexit-safe; a bare `pytest` would abort under `bash -e`.
+        pytest || code=$?
+        if [ "${code:-0}" -eq 5 ]; then exit 0; else exit "${code:-0}"; fi
