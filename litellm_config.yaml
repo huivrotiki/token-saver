@@ -1,3 +1,7 @@
+# token-saver — LiteLLM Proxy Config
+# Единая точка входа для всех агентов Serpentos
+# Подключение: export OPENAI_BASE_URL=http://localhost:4000/v1
+
 model_list:
   # ── MLX (M1 Metal, $0, приоритет 0) ─────────────────────────
   - model_name: mlx-coder-7b
@@ -36,21 +40,21 @@ model_list:
   - model_name: local-lite
     litellm_params:
       model: ollama/llama3.2:3b
-      api_base: http://localhost:11434
+      api_base: http://ollama:11434   # docker-compose hostname
       input_cost_per_token: 0.0
       output_cost_per_token: 0.0
 
   - model_name: local-code
     litellm_params:
       model: ollama/qwen2.5-coder:7b
-      api_base: http://localhost:11434
+      api_base: http://ollama:11434
       input_cost_per_token: 0.0
       output_cost_per_token: 0.0
 
   - model_name: local-medium
     litellm_params:
       model: ollama/qwen3:14b
-      api_base: http://localhost:11434
+      api_base: http://ollama:11434
       input_cost_per_token: 0.0
       output_cost_per_token: 0.0
 
@@ -84,20 +88,50 @@ model_list:
     litellm_params:
       model: gemini/gemini-2.0-flash-lite
       api_key: os.environ/GEMINI_API_KEY
+      rpm: 30
+      tpm: 1000000
 
   - model_name: gemini-flash
     litellm_params:
       model: gemini/gemini-2.0-flash
       api_key: os.environ/GEMINI_API_KEY
+      rpm: 15
+      tpm: 500000
 
   # ── ANTHROPIC (только deep задачи) ──────────────────────────
   - model_name: claude-sonnet
     litellm_params:
       model: anthropic/claude-sonnet-4-5
       api_key: os.environ/ANTHROPIC_API_KEY
+      rpm: 5
+      tpm: 80000
+
+  # ── РОУТИНГ: ТЯЖЁЛЫЕ vs ЛЁГКИЕ задачи ─────────────────────
+  # heavy: сложный код, архитектура, видео-пайплайн
+  - model_name: heavy
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      rpm: 5
+
+  # light: форматирование, парсинг, короткие утилитарные запросы
+  - model_name: light
+    litellm_params:
+      model: ollama/qwen2.5-coder:7b
+      api_base: http://ollama:11434
+      rpm: 200
+
+  # video: специализированный маршрут для видео-агентов
+  - model_name: video
+    litellm_params:
+      model: gemini/gemini-2.0-flash
+      api_key: os.environ/GEMINI_API_KEY
+      rpm: 15
 
 router_settings:
   routing_strategy: cost-based-routing
+  redis_host: redis
+  redis_port: 6379
   # Иерархия: mlx($0) → local-ollama($0) → nvidia-free($0) → gemini → claude
   fallbacks:
     - mlx-coder-7b:  [mlx-coder-3b, local-code, nvidia-deepseek, gemini-flash]
@@ -109,13 +143,53 @@ router_settings:
     - local-code:    [mlx-coder-7b, nvidia-deepseek, gemini-flash]
     - claude-sonnet: [gemini-flash]
     - nvidia-kimi:   [gemini-flash-lite]
+    - heavy:         [gemini-flash, local-code]
+    - light:         [mlx-coder-3b, nvidia-kimi]
+    - video:         [gemini-flash-lite, local-medium]
+  # Защита от бесконечных циклов агентов
+  num_retries: 2
+  timeout: 30
+  retry_after: 5
+
+# ── PER-AGENT RATE LIMITS ──────────────────────────────────────
+# Настраиваются через LiteLLM virtual keys или headers:
+# X-Agent-ID: ceo-agent → применяется лимит
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/LITELLM_DATABASE_URL  # PostgreSQL для аудита
+  store_model_in_db: true
+  # Глобальные лимиты (переопределяются per-key)
+  max_budget: 10.0          # $10 на весь прокси
+  budget_duration: "1d"     # сбрасывается ежедневно
+  alerting:
+    - slack
+  alerting_threshold: 300   # секунды до алерта при зависании
 
 litellm_settings:
+  # === СЕМАНТИЧЕСКОЕ КЭШИРОВАНИЕ ===
   cache: true
   cache_params:
     type: redis
-    host: localhost
+    host: redis            # docker-compose hostname
     port: 6379
-    ttl: 86400
-  drop_params: true
+    ttl: 86400             # 24 часа
+    similarity_threshold: 0.95   # семантический порог — кэшируем похожие запросы
+    supported_call_types:  # что кэшируем
+      - acompletion
+      - completion
+      - embedding
+  # === ОПТИМИЗАЦИЯ КОНТЕКСТА ===
+  drop_params: true        # убираем unsupported параметры провайдера
+  modify_params: true      # разрешаем пост-обработку запросов
+  max_tokens: 4096         # жёсткий лимит на ответ
+  # === БЕЗОПАСНОСТЬ ===
   telemetry: false
+  redact_user_api_key_info: true  # не логируем ключи в traces
+  # === ЛОГИРОВАНИЕ ДЛЯ AUDIT TRAIL ===
+  success_callback:
+    - "langfuse"           # трейсы (опционально)
+  failure_callback:
+    - "langfuse"
+  # JSON-лог каждого запроса (совместим с SECURITY.md audit trail)
+  access_log: true
+  access_log_file: "/app/logs/litellm-access.log"
