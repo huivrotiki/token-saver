@@ -11,9 +11,7 @@ mkdir -p "$TS_DIR"
 
 # ── Python зависимости (полный стек) ─────────────────────────
 echo -e "${BLUE}📦 Устанавливаю Python зависимости...${NC}"
-# ВАЖНО: ставим в ТОТ ЖЕ интерпретатор, которым запускается сервер (python3),
-# иначе redis/sentence-transformers попадают в другой Python и health покажет false.
-python3 -m pip install litellm flask redis dash plotly requests \
+pip install litellm flask redis dash plotly requests \
     anthropic google-generativeai openai \
     sentence-transformers --quiet
 echo -e "${GREEN}✅ Все Python зависимости установлены${NC}"
