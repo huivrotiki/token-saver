@@ -105,6 +105,31 @@ model_list:
       model: gemini/gemini-3.1-pro-preview
       api_key: os.environ/GEMINI_API_KEY
 
+  # ── KIMI CODE (Moonshot AI, FREE via kimi-code subscription) ─
+  - model_name: kimi-k3
+    litellm_params:
+      model: openai/kimi-k3
+      api_base: https://api.moonshot.ai/v1
+      api_key: sk-x2LihsWODgXJH0OalCfV1n6WRSrr8EH6GKkuYw3Ky6MdG7PX
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+
+  - model_name: kimi-k2-7-code
+    litellm_params:
+      model: openai/kimi-k2.7-code
+      api_base: https://api.moonshot.ai/v1
+      api_key: sk-x2LihsWODgXJH0OalCfV1n6WRSrr8EH6GKkuYw3Ky6MdG7PX
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+
+  - model_name: kimi-k2-5
+    litellm_params:
+      model: openai/kimi-k2.5
+      api_base: https://api.moonshot.ai/v1
+      api_key: sk-x2LihsWODgXJH0OalCfV1n6WRSrr8EH6GKkuYw3Ky6MdG7PX
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+
   # ── OMNIROUTE / HERMES (omni-main каскад, $0 Antigravity-first) ──────────
   - model_name: omni-main
     litellm_params:

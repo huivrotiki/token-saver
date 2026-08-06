@@ -461,6 +461,7 @@ def _ollama_has(model: str) -> bool:
 # FIX #7: vertex/ → google/ прямой API-ключ (ADC не нужен)
 # FIX #10: обновлены model ID
 # FIX #11: Hermes/OmniRoute — omni-main каскад через 9router (Antigravity $0 first)
+# FIX #12: Kimi K3 (1M ctx) как top deep route — прямой Moonshot API
 _ROUTE = {
     "lite":   ("ollama/llama3.2:3b",       "nvidia/meta/llama-3.1-8b-instruct"),
     "simple": ("ollama/llama3.2:3b",       "nvidia/meta/llama-3.1-8b-instruct"),
