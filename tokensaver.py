@@ -631,8 +631,8 @@ try:
 except ImportError:
     LITELLM_OK = False
 
-NINEROUTER_BASE = os.environ.get("NINEROUTER_BASE_URL", "http://localhost:20128/v1")
-NINEROUTER_KEY  = os.environ.get("NINEROUTER_KEY", "sk-523ef2ad1a864503-ztw5q3-ade7c58a")
+NINEROUTER_BASE = "http://localhost:3001/v1"
+NINEROUTER_KEY  = "6666"
 
 def _call_9router(model_path: str, messages: list, timeout: int = 120) -> Optional[str]:
     """FIX #9: HTTP запрос к 9Router вместо subprocess opencode CLI."""
@@ -718,6 +718,8 @@ def ask(prompt: str, system: str = DEFAULT_SYSTEM,
         else:
             log.warning("9ROUTER_LANE_FAIL: falling back to direct")
             model, is_local = _ROUTE[level][1], False
+            if model and model.startswith("9router/"):
+                model = "openai/" + model.split("9router/", 1)[-1]
             stats["model"] = model
 
     kwargs = {"model": model, "messages": messages}
@@ -736,6 +738,10 @@ def ask(prompt: str, system: str = DEFAULT_SYSTEM,
     if model.startswith("google/"):
         kwargs["model"]   = model
         kwargs["api_key"] = os.environ.get("GEMINI_API_KEY","")
+
+    if model.startswith("openai/omni-main") or model.startswith("openai/gemini-2.5-flash"):
+        kwargs["api_base"] = NINEROUTER_BASE
+        kwargs["api_key"]  = NINEROUTER_KEY
 
     try:
         resp = completion(**kwargs)
@@ -806,6 +812,19 @@ if __name__ == "__main__":
         @app.route("/v1/chat/completions", methods=["POST"])
         def proxy():
             data = request.json or {}
+            
+            # Transparent proxy for tool-enabled requests (bypass cache/compression)
+            if data.get("tools"):
+                import requests
+                headers = {k:v for k,v in request.headers.items() if k.lower() != 'host'}
+                resp = requests.post("http://localhost:3001/v1/chat/completions", json=data, headers=headers, stream=data.get("stream", False))
+                if data.get("stream"):
+                    def generate():
+                        for chunk in resp.iter_content(chunk_size=1024):
+                            yield chunk
+                    return app.response_class(generate(), mimetype='text/event-stream')
+                return app.response_class(resp.content, status=resp.status_code, mimetype=resp.headers.get('Content-Type', 'application/json'))
+
             msgs = data.get("messages", [])
 
             agent_id        = (request.headers.get("X-Claude-Code-Agent-Id") or
@@ -840,14 +859,31 @@ if __name__ == "__main__":
                     cost=s.get("cost_usd",0.0)
                 )
 
-            return jsonify({
+            resp_dict = {
                 "choices":[{"message":{"role":"assistant",
                             "content":result["response"]},"finish_reason":"stop"}],
                 "model": s.get("model"),
                 "session_id": session_id,
                 "agent_id": agent_id,
                 "tokensaver_stats": s
-            })
+            }
+            
+            if data.get("stream"):
+                def generate():
+                    import json
+                    import time
+                    chunk_id = "chatcmpl-" + str(int(time.time()))
+                    chunk = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "model": s.get("model"),
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": result["response"]}, "finish_reason": "stop"}]
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                return app.response_class(generate(), mimetype='text/event-stream')
+                
+            return jsonify(resp_dict)
 
         @app.route("/health")
         def health():
